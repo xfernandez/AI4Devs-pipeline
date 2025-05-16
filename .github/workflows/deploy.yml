@@ -74,22 +74,16 @@ jobs:
 
       - name: Create EC2 Spot Instance
         id: ec2
-        uses: aws-actions/amazon-ec2-run-instances@v1
-        with:
-          image-id: ${{ env.EC2_AMI }}
-          instance-type: ${{ env.EC2_INSTANCE_TYPE }}
-          key-name: ${{ env.EC2_KEY_NAME }}
-          security-group-ids: ${{ secrets.EC2_SECURITY_GROUP_ID }}
-          subnet-id: ${{ secrets.EC2_SUBNET_ID }}
-          instance-market-options: |
-            {
-              "MarketType": "spot",
-              "SpotOptions": {
-                "MaxPrice": "${{ env.SPOT_PRICE }}",
-                "SpotInstanceType": "one-time"
-              }
-            }
-          user-data: |
+        run: |
+          # Crear la instancia EC2 usando AWS CLI
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ${{ env.EC2_AMI }} \
+            --instance-type ${{ env.EC2_INSTANCE_TYPE }} \
+            --key-name ${{ env.EC2_KEY_NAME }} \
+            --security-group-ids ${{ secrets.EC2_SECURITY_GROUP_ID }} \
+            --subnet-id ${{ secrets.EC2_SUBNET_ID }} \
+            --instance-market-options "MarketType=spot,SpotOptions={MaxPrice=${{ env.SPOT_PRICE }},SpotInstanceType=one-time}" \
+            --user-data file://<(cat << 'EOF'
             #!/bin/bash
             # Configurar el script de terminación para limpiar recursos
             cat > /etc/spot-instance-termination-notice-handler.sh << 'EOF'
@@ -127,16 +121,22 @@ jobs:
             mkswap /swapfile
             swapon /swapfile
             echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+            EOF
+            ) \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+          
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
 
       - name: Wait for EC2 Instance
-        uses: aws-actions/amazon-ec2-wait-for-instance-status@v1
-        with:
-          instance-ids: ${{ steps.ec2.outputs.instance-ids }}
+        run: |
+          aws ec2 wait instance-running --instance-ids ${{ steps.ec2.outputs.instance_id }}
+          aws ec2 wait instance-status-ok --instance-ids ${{ steps.ec2.outputs.instance_id }}
 
       - name: Get EC2 Instance Public IP
         id: ip
         run: |
-          echo "ip=$(aws ec2 describe-instances --instance-ids ${{ steps.ec2.outputs.instance-ids }} --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)" >> $GITHUB_OUTPUT
+          echo "ip=$(aws ec2 describe-instances --instance-ids ${{ steps.ec2.outputs.instance_id }} --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)" >> $GITHUB_OUTPUT
 
       - name: Setup SSH
         run: |
@@ -185,6 +185,6 @@ jobs:
       - name: Output Deployment Info
         run: |
           echo "Application deployed to: http://${{ steps.ip.outputs.ip }}:3000"
-          echo "EC2 Instance ID: ${{ steps.ec2.outputs.instance-ids }}"
+          echo "EC2 Instance ID: ${{ steps.ec2.outputs.instance_id }}"
           echo "Instance Type: ${{ env.EC2_INSTANCE_TYPE }} (Spot)"
           echo "Max Price: ${{ env.SPOT_PRICE }} per hour" 
