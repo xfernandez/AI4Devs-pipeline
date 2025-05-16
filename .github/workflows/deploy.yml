@@ -1,0 +1,382 @@
+name: Deploy Backend to EC2
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: # Permite ejecución manual
+
+env:
+  AWS_REGION: eu-west-1
+  EC2_INSTANCE_TYPE: t3.micro
+  EC2_AMI: ami-0a4ca8562c4de78ff # Amazon Linux 2 AMI actualizado para eu-west-1
+  EC2_KEY_NAME: ai4devs-key
+  EC2_SECURITY_GROUP: ai4devs-sg
+  APP_DIR: backend
+  DOCKER_COMPOSE_VERSION: "2.24.6"
+  SPOT_PRICE: "0.0084" # Precio máximo por hora para t3.micro en eu-west-1
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+
+      - name: Install Dependencies
+        working-directory: ${{ env.APP_DIR }}
+        run: npm ci
+
+      - name: Run Tests
+        working-directory: ${{ env.APP_DIR }}
+        run: npm test
+
+      - name: Build Application
+        working-directory: ${{ env.APP_DIR }}
+        run: npm run build
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-build
+          path: ${{ env.APP_DIR }}/dist
+          retention-days: 1
+
+  deploy:
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-build
+          path: ${{ env.APP_DIR }}/dist
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create EC2 Spot Instance
+        id: ec2
+        run: |
+          # Crear el archivo de user-data
+          cat > user-data.sh << 'EOT'
+          #!/bin/bash
+          # Logging
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+          echo "=== Iniciando configuración ==="
+          
+          # Instalación básica
+          yum update -y
+          yum install -y docker curl
+
+          # Instalar Node.js (usando amazon-linux-extras)
+          echo "Instalando Node.js..."
+          amazon-linux-extras enable nodejs16
+          yum clean metadata
+          yum -y install nodejs
+
+          # Verificar instalaciones
+          node --version
+          npm --version
+
+          # Configurar Docker
+          systemctl start docker
+          systemctl enable docker
+          usermod -a -G docker ec2-user
+
+          # Instalar Docker Compose
+          curl -L "https://github.com/docker/compose/releases/download/v${{ env.DOCKER_COMPOSE_VERSION }}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+
+          echo "=== Configuración completada ==="
+          EOT
+
+          # Crear la instancia EC2
+          echo "Creando instancia EC2..."
+          SPOT_OPTIONS='{"MarketType":"spot","SpotOptions":{"MaxPrice":"'"${{ env.SPOT_PRICE }}"'","SpotInstanceType":"one-time"}}'
+          
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "${{ env.EC2_AMI }}" \
+            --instance-type "${{ env.EC2_INSTANCE_TYPE }}" \
+            --key-name "${{ env.EC2_KEY_NAME }}" \
+            --security-group-ids "${{ secrets.EC2_SECURITY_GROUP_ID }}" \
+            --subnet-id "${{ secrets.EC2_SUBNET_ID }}" \
+            --associate-public-ip-address \
+            --user-data "file://user-data.sh" \
+            --instance-market-options "$SPOT_OPTIONS" \
+            --query "Instances[0].InstanceId" \
+            --output text)
+
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for EC2 Instance
+        run: |
+          echo "Esperando a que la instancia esté en ejecución..."
+          aws ec2 wait instance-running --instance-ids ${{ steps.ec2.outputs.instance_id }}
+          
+          echo "Esperando a que el estado del sistema esté OK..."
+          aws ec2 wait instance-status-ok --instance-ids ${{ steps.ec2.outputs.instance_id }}
+          
+          # Verificar logs de user-data
+          echo "Verificando logs de configuración..."
+          aws ec2 get-console-output --instance-id ${{ steps.ec2.outputs.instance_id }} --output text
+
+      - name: Get EC2 Instance Public IP
+        id: ip
+        run: |
+          max_attempts=10  # 10 intentos
+          attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "Intento $attempt de $max_attempts para obtener la IP pública..."
+            
+            # Mostrar información completa de la instancia para diagnóstico
+            echo "Estado actual de la instancia:"
+            aws ec2 describe-instances \
+              --instance-ids ${{ steps.ec2.outputs.instance_id }} \
+              --query 'Reservations[0].Instances[0].[State.Name,PublicIpAddress,PublicDnsName]' \
+              --output text
+            
+            # Intentar obtener la IP
+            PUBLIC_IP=$(aws ec2 describe-instances \
+              --instance-ids ${{ steps.ec2.outputs.instance_id }} \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+            
+            if [ "$PUBLIC_IP" != "None" ] && [ ! -z "$PUBLIC_IP" ]; then
+              echo "✅ IP pública obtenida: $PUBLIC_IP"
+              echo "ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            
+            echo "Esperando 30 segundos antes del siguiente intento..."
+            sleep 30
+            attempt=$((attempt + 1))
+          done
+          
+          echo "❌ No se pudo obtener la IP pública después de $max_attempts intentos"
+          echo "Información detallada de la instancia:"
+          aws ec2 describe-instances \
+            --instance-ids ${{ steps.ec2.outputs.instance_id }} \
+            --output json
+          
+          exit 1
+
+      - name: Setup SSH
+        run: |
+          # Crear directorio SSH y configurar permisos
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          
+          # Guardar la clave SSH
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2.pem
+          chmod 600 ~/.ssh/ec2.pem
+          
+          # Verificar que tenemos una IP válida
+          if [ -z "${{ steps.ip.outputs.ip }}" ]; then
+            echo "❌ IP no válida"
+            exit 1
+          fi
+          
+          echo "🔍 IP a conectar: ${{ steps.ip.outputs.ip }}"
+          
+          # Limpiar known_hosts existente por si acaso
+          rm -f ~/.ssh/known_hosts
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          
+          # Intentar añadir la clave SSH con reintento y más verbosidad
+          for i in {1..5}; do
+            echo "Intento $i: Ejecutando ssh-keyscan..."
+            
+            # Ejecutar keyscan con más detalle
+            ssh-keyscan -v -H ${{ steps.ip.outputs.ip }} 2>&1 | tee /tmp/keyscan.log
+            
+            if [ -s /tmp/keyscan.log ]; then
+              cat /tmp/keyscan.log >> ~/.ssh/known_hosts
+              echo "Contenido actual de known_hosts:"
+              cat ~/.ssh/known_hosts
+              
+              if grep -q "${{ steps.ip.outputs.ip }}" ~/.ssh/known_hosts; then
+                echo "✅ Clave SSH añadida correctamente"
+                
+                # Intentar una conexión de prueba
+                if ssh -i ~/.ssh/ec2.pem -o StrictHostKeyChecking=yes -o BatchMode=yes ec2-user@${{ steps.ip.outputs.ip }} "echo '✅ Conexión SSH exitosa'"; then
+                  echo "✅ Prueba de conexión exitosa"
+                  exit 0
+                else
+                  echo "⚠️ La clave se añadió pero la conexión falló"
+                fi
+              else
+                echo "⚠️ La clave no se encontró en known_hosts después de añadirla"
+              fi
+            else
+              echo "⚠️ ssh-keyscan no produjo salida"
+            fi
+            
+            echo "Esperando 10 segundos antes del siguiente intento..."
+            sleep 10
+          done
+          
+          echo "❌ No se pudo configurar SSH después de 5 intentos"
+          echo "Últimos logs de keyscan:"
+          cat /tmp/keyscan.log
+          exit 1
+
+      - name: Deploy Application
+        run: |
+          # Crear directorio de la aplicación
+          ssh -i ~/.ssh/ec2.pem ec2-user@${{ steps.ip.outputs.ip }} "mkdir -p ~/app"
+          
+          # Copiar archivos necesarios
+          scp -i ~/.ssh/ec2.pem -r ${{ env.APP_DIR }}/* ec2-user@${{ steps.ip.outputs.ip }}:~/app/
+          scp -i ~/.ssh/ec2.pem docker-compose.yml ec2-user@${{ steps.ip.outputs.ip }}:~/app/
+          
+          # Configurar y desplegar la aplicación
+          ssh -i ~/.ssh/ec2.pem ec2-user@${{ steps.ip.outputs.ip }} "
+            cd ~/app
+            
+            # Configurar variables de entorno
+            echo 'DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+            DB_USER=${{ secrets.DB_USER }}
+            DB_NAME=${{ secrets.DB_NAME }}
+            DB_PORT=5432
+            PORT=3000
+            NODE_ENV=production' > .env
+            
+            # Iniciar base de datos
+            docker-compose up -d
+            
+            # Instalar Node.js 16 (compatible con Amazon Linux 2)
+            echo "Instalando Node.js 16..."
+            curl -sL https://rpm.nodesource.com/setup_16.x | sudo bash -
+            sudo yum install -y nodejs
+
+            # Verificar la instalación de Node.js
+            echo "Verificando instalación de Node.js..."
+            node -v
+            npm -v
+
+            # Limpiar npm cache y verificar permisos
+            echo "Configurando npm..."
+            sudo npm cache clean -f
+            sudo chown -R ec2-user:ec2-user ~/.npm
+            
+            # Instalar PM2 globalmente con sudo
+            echo "Instalando PM2..."
+            sudo npm install -g pm2@latest
+            
+            # Instalar dependencias del proyecto
+            echo "Instalando dependencias..."
+            cd ~/app
+            npm ci
+            
+            echo "Generando Prisma Client..."
+            npm run prisma:generate
+            
+            echo "Ejecutando migraciones..."
+            npx prisma migrate deploy
+            
+            # Iniciar aplicación con PM2
+            echo "Iniciando aplicación..."
+            pm2 start dist/index.js --name ai4devs-backend
+            pm2 save
+            
+            # Configurar PM2 para iniciar en el arranque
+            sudo env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u ec2-user --hp /home/ec2-user
+            sudo systemctl enable pm2-ec2-user
+            
+            # Verificar que la aplicación está corriendo
+            if ! pm2 list | grep -q "ai4devs-backend"; then
+              echo "❌ Error: La aplicación no está corriendo"
+              pm2 logs
+              exit 1
+            fi
+            echo "✅ Aplicación desplegada correctamente"
+          "
+
+      - name: Cleanup and Report
+        if: always()
+        run: |
+          # Primero recolectar logs si hubo fallo
+          if [ "${{ job.status }}" != "success" ] && [ -n "${{ steps.ec2.outputs.instance_id }}" ]; then
+            echo "❌ El despliegue falló o fue cancelado. Recolectando logs antes de la limpieza..."
+            
+            # Configurar SSH para recolección de logs
+            mkdir -p ~/.ssh
+            chmod 700 ~/.ssh
+            echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2.pem
+            chmod 600 ~/.ssh/ec2.pem
+            
+            if [ -n "${{ steps.ip.outputs.ip }}" ]; then
+              echo "Recolectando logs del sistema..."
+              ssh -i ~/.ssh/ec2.pem -o StrictHostKeyChecking=no ec2-user@${{ steps.ip.outputs.ip }} "
+                echo '=== System Logs ==='
+                sudo journalctl -n 100
+                echo '=== Docker Logs ==='
+                sudo docker ps -a
+                sudo docker logs \$(sudo docker ps -aq) || echo 'No hay contenedores'
+                echo '=== PM2 Logs ==='
+                sudo env 'PATH=$PATH' /usr/local/bin/pm2 logs --nostream --lines 100 || echo 'PM2 no disponible'
+                echo '=== Node Version ==='
+                node -v || echo 'Node no disponible'
+                echo '=== Disk Space ==='
+                df -h
+                echo '=== Memory Usage ==='
+                free -m
+              " || echo "No se pudieron recolectar logs remotos"
+            fi
+            
+            # Terminar la instancia EC2
+            echo "Terminando instancia EC2..."
+            if aws ec2 terminate-instances --instance-ids ${{ steps.ec2.outputs.instance_id }}; then
+              echo "✅ Comando de terminación enviado correctamente"
+              aws ec2 wait instance-terminated --instance-ids ${{ steps.ec2.outputs.instance_id }}
+              echo "✅ Instancia EC2 terminada correctamente"
+            else
+              echo "⚠️ Error al terminar la instancia"
+            fi
+          fi
+          
+          # Limpiar clave SSH
+          rm -f ~/.ssh/ec2.pem
+          
+          # Reportar estado del despliegue
+          echo "=== Resumen del Despliegue ==="
+          echo "Estado: ${{ job.status }}"
+          echo "Instancia ID: ${{ steps.ec2.outputs.instance_id || 'No creada' }}"
+          echo "IP Pública: ${{ steps.ip.outputs.ip || 'No asignada' }}"
+          echo "Tipo: ${{ env.EC2_INSTANCE_TYPE }} (Spot)"
+          echo "Precio máximo: ${{ env.SPOT_PRICE }} por hora"
+          
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ Aplicación desplegada en: http://${{ steps.ip.outputs.ip }}:3000"
+          else
+            echo "❌ El despliegue no fue exitoso"
+            echo "Consulte los logs anteriores para más detalles"
+          fi
+
+      - name: Output Deployment Info
+        run: |
+          echo "Application deployed to: http://${{ steps.ip.outputs.ip }}:3000"
+          echo "EC2 Instance ID: ${{ steps.ec2.outputs.instance_id }}"
+          echo "Instance Type: ${{ env.EC2_INSTANCE_TYPE }} (Spot)"
+          echo "Max Price: ${{ env.SPOT_PRICE }} per hour" 
