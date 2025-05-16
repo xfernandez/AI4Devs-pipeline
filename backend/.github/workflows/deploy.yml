@@ -10,14 +10,14 @@ on:
   workflow_dispatch: # Permite ejecución manual
 
 env:
-  AWS_REGION: eu-west-1 # Cambiar según tu región preferida
+  AWS_REGION: eu-west-1
   EC2_INSTANCE_TYPE: t3.micro
-  EC2_AMI: ami-0c55b159cbfafe1f0 # Amazon Linux 2 AMI - actualizar según región
-  EC2_KEY_NAME: ai4devs-key # Nombre de tu key pair en AWS
-  EC2_SECURITY_GROUP: ai4devs-sg # Nombre de tu security group
+  EC2_AMI: ami-0a4ca8562c4de78ff # Amazon Linux 2 AMI actualizado para eu-west-1
+  EC2_KEY_NAME: ai4devs-key
+  EC2_SECURITY_GROUP: ai4devs-sg
   APP_DIR: backend
   DOCKER_COMPOSE_VERSION: "2.24.6"
-  SPOT_PRICE: "0.0084" # Precio máximo por hora para t3.micro en eu-west-1 (ajustar según región)
+  SPOT_PRICE: "0.0084" # Precio máximo por hora para t3.micro en eu-west-1
 
 jobs:
   test-and-build:
